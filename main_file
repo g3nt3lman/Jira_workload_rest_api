@@ -1,0 +1,145 @@
+from atlassian import Jira
+import requests
+import pandas as pd
+from requests.auth import HTTPBasicAuth
+import json
+from googleapiclient import discovery
+from googleapiclient.discovery import build
+from functions import gsheet_api_check, ingestResultintoGSHEET, CleanGSHEET, updateOneValue, gsheet_api_check, get_connection
+import itertools
+import string
+import numpy as np
+from datetime import datetime, timedelta
+
+def retry(times):
+    def decorator(func):
+        def newfn(*args, **kwargs):
+            attempt = 0
+            while attempt < times:
+                try:
+                    return func(*args, **kwargs)
+                except Exception:
+                    print(
+                        'Exception thrown when attempting to run %s, attempt '
+                        '%d of %d' % (func, attempt, times)
+                    )
+                    attempt += 1
+            return func(*args, **kwargs)
+        return newfn
+    return decorator
+
+class JiraLogs():
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+        self.jira = Jira(url='https://server_name', username = username, password = password, cloud=True)
+        
+    @retry(times=3)
+    def GetAllIssues(self,start_):        
+        jql_request = 'project = SPPLBIMKTS'
+        issues_all = self.jira.jql(jql_request, start = start_, limit = 1000)
+        return(issues_all)
+    
+    @retry(times=3)
+    def getChangeLog(self, issues_all, i):
+        url2 = 'https://server_name/rest/api/latest/issue/'+issues_all['issues'][i]['key']+'?expand=changelog'
+        auth = HTTPBasicAuth(self.username, self.password)
+        headers = {"Content-type":"application/json","Accept":"application/json"}
+        response2 = requests.request("GET", url2, headers=headers, auth=auth) 
+        change_log = json.loads(response2.text)['changelog']['histories']
+        return(change_log)
+    
+    def getJiraLogs(self, jql_request):
+        jira_values = self.jira.jql(jql_request, start = 0, limit = 1)
+        limit_ = jira_values['total']
+        start_ = 0
+        step_ = 200
+        df_change_log = pd.DataFrame()
+        
+        while start_ < limit_:  
+            issues_all = self.GetAllIssues(start_)
+            for i in range(0,len(issues_all['issues'])):
+                print(i+start_)
+                change_log = self.getChangeLog(issues_all, i)
+                for f in range(0,len(change_log)):
+                    for log_item in change_log[f]['items']:    
+                        item_created = datetime.strptime(change_log[f]
+                                            ['created'].replace('T',' ').split('+')[0], 
+                                                '%Y-%m-%d %H:%M:%S.%f') - timedelta(hours=7)
+                        if log_item['field']=='timespent':
+                            len_df = len(df_change_log)
+                            df_change_log.loc[len_df, 'item_created'] = item_created
+                            df_change_log.loc[len_df, 'WorklogId'] = change_log[f]['items'][0]['from']
+                            df_change_log.loc[len_df, 'author'] = change_log[f]['author']['emailAddress']
+                            df_change_log.loc[len_df, 'from_string'] = log_item['fromString']
+                            df_change_log.loc[len_df, 'to_string'] = log_item['toString']
+                            print(df_change_log.loc[len_df, 'item_created'])
+                
+            start_ = start_ + step_
+        
+        return(df_change_log)
+
+class PostgresOps():
+    def __init__(self, df_change_log):
+        self.df_change_log = df_change_log
+        self.conn = get_connection(db_type = 'Postgres', db_name = 'PG_DB', user ='XXX', pwd='XXXX')
+        self.today = datetime.now().strftime("%Y-%m-%d")
+        
+    def getLastLog(self):
+        query = f'select * from security_tables.jira_logs'
+        df_pg_jira = pd.read_sql(query, con=self.conn)
+    
+        return(df_pg_jira)
+    
+    def loadNewLogs(self):
+        ## sprawdzenie nowych logow
+        df_pg_jira = self.getLastLog()
+        old_logs = np.unique(df_pg_jira['WorklogId'].values)
+        new_logs = np.unique(self.df_change_log['WorklogId'].values)
+        new_logs_to_upload = list(set(new_logs) - set(old_logs))
+        df_out_2_pg = self.df_change_log.loc[self.df_change_log['WorklogId'].isin(new_logs_to_upload)]
+    
+        ########## ladowanie do postgres nowych logow
+        self.df_change_log['ingestion_timestamp']=self.today
+        df_out_2_pg.to_sql('jira_logs', self.conn, schema='security_tables', if_exists='append', index=False)
+    
+    def save2TableauDataSource(self):
+        df_pg_jira = self.getLastLog()
+        df_logs_combined = pd.concat([df_pg_jira, self.df_change_log])
+        un_combined_logs = np.unique(df_logs_combined['WorklogId'].values)
+        df_logs_total = df_logs_combined.loc[df_logs_combined['WorklogId'].isin(un_combined_logs)].drop_duplicates(subset=['WorklogId'], keep='last')
+        un_users = np.unique(df_logs_total['author'].values)
+
+        df_logs_total['from_string'].fillna(value='0', inplace=True)
+        df_logs_total['from_string'] = df_logs_total['from_string'].astype(int)
+        df_logs_total['to_string'] = df_logs_total['to_string'].astype(int)
+        df_logs_total['time_spent_hours'] = (df_logs_total['to_string']- df_logs_total['from_string'])/60/60
+
+        for dc in range(0,len(df_logs_total)):
+            df_logs_total.loc[dc, 'item_created_date'] = df_logs_total.loc[dc,'item_created'].date()
+            
+        df_aggregated = pd.DataFrame()
+        for u in range(0, len(un_users)):
+            df_un_user = df_logs_total.loc[df_logs_total['author']==un_users[u]]
+            df_un_user_agg = df_un_user.groupby('item_created_date').agg('sum')
+            df_un_user_agg['author'] = un_users[u]
+            df_aggregated = pd.concat([df_aggregated,df_un_user_agg])
+            
+        df_aggregated = df_aggregated.reset_index(drop = False)
+        df_aggregated['item_created_date'] = df_aggregated['item_created_date'].astype(str)
+        df_aggregated_out = df_aggregated[['item_created_date','time_spent_hours','author']]
+
+        df_aggregated_out['ingestion_timestamp']=self.today
+        df_aggregated_out.to_sql('jira_output', self.conn, schema='security_tables', if_exists='replace', index=False)
+        
+if __name__ == '__main__':
+    username= 'XXXXX'
+    password= 'XXXXX'
+    my_jira = JiraLogs(username, password)
+    jql_request = 'project = TEST'
+    df_change_log = my_jira.getJiraLogs(jql_request)
+
+    my_pg_ops = PostgresOps(df_change_log)
+    my_pg_ops.loadNewLogs()
+    my_pg_ops.save2TableauDataSource()
+
